@@ -1,0 +1,22 @@
+# --- Copies locales de la configuration (adresses, identifiants du réseau réel) ---
+docker-compose.override.yml
+*.local.yml
+.env
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- Systeme / editeurs ---
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# --- Tests : jamais publies (ils restent sur le disque) ---
+tests/
+test_*.py
+*_test.py
+essai*.py

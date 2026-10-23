@@ -1,0 +1,214 @@
+# Truchement 1.0 — relais NUT Synology (ups) -> UGOS (ups0)
+# Copyright (C) 2026 ETDEL — https://github.com/theptitprince/Truchement
+# Logiciel libre : GPL-3.0-or-later, avec les conditions additionnelles de NOTICE.
+# Voir les fichiers LICENSE et NOTICE du dépôt. Fourni SANS AUCUNE GARANTIE.
+#
+# Container Manager (Synology). Fichier autonome : le script est inclus.
+# Le relais a sa propre IP LAN (192.168.1.210) et lit le NUT du Synology
+# via un petit réseau Docker interne (172.31.93.1 = le Synology vu du conteneur).
+# Adaptez les adresses marquées « à adapter » à votre réseau.
+services:
+  truchement:
+    image: python:3.12-alpine
+    container_name: truchement
+    restart: unless-stopped
+    networks:
+      lan:
+        ipv4_address: 192.168.1.210   # à adapter : IP libre du LAN, à donner à UGOS
+      interne:
+        ipv4_address: 172.31.93.2     # IP à autoriser dans DSM > UPS
+    environment:
+      TZ: Europe/Paris
+      UPSTREAM_HOST: 172.31.93.1
+      UPSTREAM_PORT: "3493"
+      LISTEN_HOST: 0.0.0.0
+      LISTEN_PORT: "3493"
+      ALLOWED_CLIENTS: 192.168.1.201   # à adapter : IP du NAS UGREEN (plusieurs : séparées par des virgules)
+      CLIENT_UPS: ups0
+      SERVER_UPS: ups
+      NUT_USER: monuser               # identifiants fixes du serveur NUT de DSM
+      NUT_PASS: secret
+      VERBOSE: "0"
+    command:
+      - python
+      - -u
+      - -c
+      - |
+        """
+        Truchement — relais/traducteur NUT entre UGOS (client) et Synology (serveur).
+
+        - UGOS demande l'UPS « ups0 », Synology ne connaît que « ups » : renommage dans les deux sens.
+        - Les identifiants envoyés par UGOS sont remplacés par ceux de Synology (monuser / secret).
+        - Le dialogue est affiché (sauf lignes VAR) pour diagnostic.
+
+        Configuration par variables d'environnement (valeurs par défaut entre crochets) :
+          UPSTREAM_HOST [192.168.1.200]  UPSTREAM_PORT [3493]
+          LISTEN_HOST [0.0.0.0]  LISTEN_PORT [3493]
+          ALLOWED_CLIENTS [vide = tous] : IP autorisées, séparées par des virgules
+          CLIENT_UPS [ups0]  SERVER_UPS [ups]  NUT_USER [monuser]  NUT_PASS [secret]
+          VERBOSE [0] : 0 = journal réduit (connexions d'auth, erreurs, changements d'état UPS)
+                        1 = tout le dialogue (hors contenu des LIST VAR)
+
+        Truchement, par ETDEL — https://github.com/theptitprince/Truchement
+        Copyright (C) 2026 ETDEL — GPL-3.0-or-later, voir LICENSE et NOTICE.
+        """
+        import os
+        import re
+        import socket
+        import threading
+        from datetime import datetime
+
+        APP_VERSION = "1.0"
+        ORIGINE = "Truchement, par ETDEL — https://github.com/theptitprince/Truchement"
+
+        UPSTREAM = (os.getenv("UPSTREAM_HOST", "192.168.1.200"), int(os.getenv("UPSTREAM_PORT", "3493")))
+        LISTEN_HOST = os.getenv("LISTEN_HOST", "0.0.0.0")
+        LISTEN_PORT = int(os.getenv("LISTEN_PORT", "3493"))
+        ALLOWED = {ip.strip() for ip in os.getenv("ALLOWED_CLIENTS", "").split(",") if ip.strip()}
+        CLIENT_UPS = os.getenv("CLIENT_UPS", "ups0")
+        SERVER_UPS = os.getenv("SERVER_UPS", "ups")
+        NUT_USER = os.getenv("NUT_USER", "monuser")
+        NUT_PASS = os.getenv("NUT_PASS", "secret")
+        VERBOSE = os.getenv("VERBOSE", "0") == "1"
+
+        RE_STATUS = re.compile(r'^VAR \S+ ups\.status "([^"]*)"')
+        _etat = {"status": None}
+        _verrou = threading.Lock()
+
+
+        def suivre_statut(ligne):
+            """Journalise chaque changement de ups.status (OL, OB, LB, FSD...)."""
+            m = RE_STATUS.match(ligne)
+            if not m:
+                return
+            with _verrou:
+                if m.group(1) != _etat["status"]:
+                    log(f"*** ups.status : {_etat['status'] or '?'} -> {m.group(1)}")
+                    _etat["status"] = m.group(1)
+
+        # Nom d'UPS en tant que mot isolé (hors valeurs entre guillemets et noms de variables)
+        RE_CLIENT = re.compile(rf'(?<![\w."-]){re.escape(CLIENT_UPS)}(?![\w."-])')
+        RE_SERVER = re.compile(rf'(?<![\w."-]){re.escape(SERVER_UPS)}(?![\w."-])')
+
+
+        def log(msg):
+            print(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}", flush=True)
+
+
+        def vers_serveur(ligne):
+            """Réécrit une commande client avant envoi au Synology."""
+            mots = ligne.split(" ", 1)
+            cmd = mots[0].upper()
+            if cmd == "USERNAME":
+                return f"USERNAME {NUT_USER}", f"USERNAME {mots[1] if len(mots) > 1 else ''} -> {NUT_USER}"
+            if cmd == "PASSWORD":
+                return f"PASSWORD {NUT_PASS}", "PASSWORD *** -> (Synology)"
+            nouvelle = RE_CLIENT.sub(SERVER_UPS, ligne)
+            return nouvelle, (ligne if nouvelle == ligne else f"{ligne}  ->  {nouvelle}")
+
+
+        def vers_client(ligne):
+            """Réécrit une réponse du Synology avant renvoi au client."""
+            return RE_SERVER.sub(CLIENT_UPS, ligne)
+
+
+        def relayer(src, dst, sens, peer, traduire):
+            buf = b""
+            dans_liste = False
+            nb_var = 0
+            try:
+                while True:
+                    data = src.recv(4096)
+                    if not data:
+                        break
+                    buf += data
+                    while b"\n" in buf:
+                        brut, buf = buf.split(b"\n", 1)
+                        ligne = brut.decode(errors="replace").rstrip("\r")
+                        if traduire is vers_serveur:
+                            sortie, trace = vers_serveur(ligne)
+                        else:
+                            sortie = vers_client(ligne)
+                            trace = sortie
+                            suivre_statut(ligne)
+                        dst.sendall((sortie + "\n").encode())
+
+                        if sortie.startswith("BEGIN LIST"):
+                            dans_liste, nb_var = True, 0
+                        elif sortie.startswith("END LIST"):
+                            dans_liste = False
+                            if VERBOSE:
+                                log(f"{peer} {sens} ({nb_var} lignes) {trace}")
+                            continue
+                        if dans_liste:
+                            nb_var += 1
+                            continue
+
+                        important = (sortie.startswith("ERR") and "FEATURE-NOT-CONFIGURED" not in sortie) \
+                            or sortie.split(" ", 1)[0].upper() in ("USERNAME", "PASSWORD", "LOGIN", "FSD")
+                        if VERBOSE or important:
+                            log(f"{peer} {sens} {trace}")
+            except OSError:
+                pass
+            finally:
+                for s in (src, dst):
+                    try:
+                        s.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+
+
+        def gerer(client, adresse):
+            peer = adresse[0]
+            if ALLOWED and peer not in ALLOWED:
+                log(f"!!! connexion refusée de {peer} (hors ALLOWED_CLIENTS)")
+                client.close()
+                return
+            if VERBOSE:
+                log(f"--- connexion de {peer}")
+            try:
+                amont = socket.create_connection(UPSTREAM, timeout=5)
+                amont.settimeout(None)
+            except OSError as e:
+                log(f"!!! serveur NUT {UPSTREAM[0]}:{UPSTREAM[1]} injoignable : {e}")
+                client.close()
+                return
+            threading.Thread(target=relayer, args=(client, amont, "client >>", peer, vers_serveur), daemon=True).start()
+            relayer(amont, client, "serveur <<", peer, vers_client)
+            if VERBOSE:
+                log(f"--- fin {peer}")
+
+
+        def main():
+            log(f"{ORIGINE} — version {APP_VERSION}")
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((LISTEN_HOST, LISTEN_PORT))
+            srv.listen()
+            log(f"Relais NUT {LISTEN_HOST}:{LISTEN_PORT} -> {UPSTREAM[0]}:{UPSTREAM[1]}  "
+                f"(UPS {CLIENT_UPS} <-> {SERVER_UPS}, clients {', '.join(sorted(ALLOWED)) or 'tous'})")
+            try:
+                while True:
+                    c, a = srv.accept()
+                    threading.Thread(target=gerer, args=(c, a), daemon=True).start()
+            except KeyboardInterrupt:
+                log("Arrêt.")
+
+
+        if __name__ == "__main__":
+            main()
+
+networks:
+  lan:
+    driver: macvlan
+    driver_opts:
+      parent: ovs_eth0        # eth0 si Open vSwitch est désactivé sur le Synology
+    ipam:
+      config:
+        - subnet: 192.168.1.0/24   # à adapter : sous-réseau du LAN
+  interne:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.93.0/24
+          gateway: 172.31.93.1

@@ -1,0 +1,7 @@
+# Fins de ligne normalisees par git ; le poste les adapte a l'extraction.
+* text=auto
+
+# Le fichier compose est colle tel quel dans Container Manager (Synology,
+# Linux) : toujours en fins de ligne LF.
+*.yml text eol=lf
+*.yaml text eol=lf
