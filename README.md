@@ -4,7 +4,7 @@
 
 **Un onduleur sur le Synology, l'UGREEN prévenu aussi.**
 
-![Version](https://img.shields.io/badge/version-1.0-2ea44f)
+![Version](https://img.shields.io/badge/version-1.1.0-2ea44f)
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![Docker Compose](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
 ![NUT](https://img.shields.io/badge/protocole-NUT%20%2F%203493-0a7ea4)
@@ -37,6 +37,11 @@ passer tout le reste tel quel. Quand le courant tombe, UGOS voit l'onduleur
 passer sur batterie (`OB`), puis batterie faible (`LB`) ou arrêt forcé
 (`FSD`), exactement comme le Synology.
 
+Depuis la 1.1.0, Truchement peut aussi **réveiller le NAS UGREEN par
+Wake-on-LAN** quand le secteur revient alors qu'il s'est déjà arrêté : sans
+cela, il resterait éteint (voir
+[6. Réveil du NAS UGREEN](#6-réveil-du-nas-ugreen-wake-on-lan)).
+
 ```
  UGREEN (UGOS)                    TRUCHEMENT                       SYNOLOGY (DSM)
  client NUT        ----------->   192.168.1.210:3493   ---------->  serveur NUT
@@ -45,7 +50,7 @@ passer sur batterie (`OB`), puis batterie faible (`LB`) ou arrêt forcé
                    <-----------   ups ↔ ups0           <----------  monuser / secret
 ```
 
-Version actuelle : 1.0 — l'historique des livraisons est dans
+Version actuelle : 1.1.0 — l'historique des livraisons est dans
 [CHANGELOG.md](CHANGELOG.md).
 
 ## Sommaire
@@ -55,10 +60,11 @@ Version actuelle : 1.0 — l'historique des livraisons est dans
 - [3. Installation](#3-installation)
 - [4. Réglages](#4-réglages)
 - [5. Comment ça marche](#5-comment-ça-marche)
-- [6. Le journal](#6-le-journal)
-- [7. Sécurité](#7-sécurité)
-- [8. En cas de souci](#8-en-cas-de-souci)
-- [9. Licence](#9-licence)
+- [6. Réveil du NAS UGREEN (Wake-on-LAN)](#6-réveil-du-nas-ugreen-wake-on-lan)
+- [7. Le journal](#7-le-journal)
+- [8. Sécurité](#8-sécurité)
+- [9. En cas de souci](#9-en-cas-de-souci)
+- [10. Licence](#10-licence)
 
 ---
 
@@ -107,12 +113,16 @@ est inclus dans le fichier compose.
    démarre le conteneur `truchement`.
 
 Dans le journal du conteneur (*Container Manager > Conteneur > truchement >
-Journal*), deux lignes doivent apparaître :
+Journal*), trois lignes doivent apparaître :
 
 ```
-2026-10-23 14:02:11  Truchement, par ETDEL — https://github.com/theptitprince/Truchement — version 1.0
+2026-10-23 14:02:11  Truchement, par ETDEL — https://github.com/theptitprince/Truchement — version 1.1.0
+2026-10-23 14:02:11  WoL inactif (WOL_MAC vide)
 2026-10-23 14:02:11  Relais NUT 0.0.0.0:3493 -> 172.31.93.1:3493  (UPS ups0 <-> ups, clients 192.168.1.201)
 ```
+
+Pour le réveil du NAS UGREEN, voir
+[6. Réveil du NAS UGREEN](#6-réveil-du-nas-ugreen-wake-on-lan).
 
 ### Côté UGREEN : écouter le relais
 
@@ -141,13 +151,14 @@ ceux du Synology. UGOS doit alors afficher l'onduleur, son état et sa charge.
 | `UPSTREAM_PORT` | `3493` | Port du serveur NUT. |
 | `LISTEN_HOST` | `0.0.0.0` | Adresse d'écoute du relais. |
 | `LISTEN_PORT` | `3493` | Port d'écoute du relais. |
-| `ALLOWED_CLIENTS` | *(vide = tous)* | Adresses autorisées à se connecter, séparées par des virgules. **À remplir** : voir [7. Sécurité](#7-sécurité). |
+| `ALLOWED_CLIENTS` | *(vide = tous)* | Adresses autorisées à se connecter, séparées par des virgules. **À remplir** : voir [8. Sécurité](#8-sécurité). |
 | `CLIENT_UPS` | `ups0` | Nom de l'onduleur côté client (UGOS). |
 | `SERVER_UPS` | `ups` | Nom de l'onduleur côté serveur (DSM). |
 | `NUT_USER` | `monuser` | Identifiant envoyé au serveur NUT (celui de DSM est fixe). |
 | `NUT_PASS` | `secret` | Mot de passe envoyé au serveur NUT (celui de DSM est fixe). |
 | `VERBOSE` | `0` | `0` : journal réduit ; `1` : tout le dialogue. |
 | `TZ` | `Europe/Paris` | Fuseau horaire des dates du journal. |
+| `WOL_MAC`, `WOL_IP`, `WOL_PORT`, `WOL_BROADCAST`, `WOL_POLL`, `WOL_STABLE`, `WOL_RETRY`, `WOL_MAX`, `WOL_BOOT` | *(`WOL_MAC` vide = inactif)* | Réveil Wake-on-LAN du NAS UGREEN : voir [6. Réveil du NAS UGREEN](#6-réveil-du-nas-ugreen-wake-on-lan). |
 
 Après une modification : *Container Manager > Projet > truchement > Action >
 Construire* (ou Arrêter puis Démarrer) pour que le conteneur la prenne en
@@ -179,7 +190,134 @@ variables (`ups.status`, `ups.load`…) et les valeurs entre guillemets
 restent intacts. Tout le reste passe tel quel, y compris les commandes
 `LOGIN` et `FSD` qui déclenchent l'arrêt des machines.
 
-## 6. Le journal
+## 6. Réveil du NAS UGREEN (Wake-on-LAN)
+
+### Le trou
+
+Sur batterie, le NAS UGREEN s'arrête le premier (délai d'arrêt d'UGOS), le
+Synology quelques minutes après (délai de DSM : mode sécurisé, puis coupure
+de l'onduleur). Les deux NAS redémarrent seuls au retour du courant, grâce à
+leur réglage de redémarrage automatique après coupure.
+
+Mais si le secteur revient **après l'arrêt du UGREEN et avant la coupure de
+l'onduleur**, le UGREEN n'a jamais perdu son alimentation : son redémarrage
+automatique ne se déclenche pas, et **il reste éteint indéfiniment**.
+
+```
+secteur      ━━━━━━━━┓                      ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                     ┗━━━━━ coupure ━━━━━━━━┛
+NAS UGREEN   ━━━━━━━━━━━━━━━━━┓ arrêt (UGOS)
+                              ┗━━━━━━━━━━━━━━━━━━ éteint ……… sans WoL : pour toujours
+Synology     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ (son délai n'est pas atteint)
+                                            ↑ le trou : Truchement envoie le paquet magique
+```
+
+### Ce que fait Truchement
+
+1. **Il lit lui-même l'état de l'onduleur** sur le serveur NUT de DSM, toutes
+   les `WOL_POLL` secondes, sans attendre les questions d'UGOS — éteint, le
+   UGREEN ne demande plus rien. Il n'ouvre pas de session (`LOGIN`) : DSM n'a
+   pas à l'attendre avant de s'arrêter.
+2. **Il s'arme** dès que l'onduleur passe sur batterie (`OB`), en batterie
+   faible (`LB`) ou en arrêt forcé (`FSD`). Un serveur NUT injoignable (DSM en
+   mode sécurisé) ne le désarme pas.
+3. **Au retour du secteur**, quand l'état `OL` est stable depuis
+   `WOL_STABLE` secondes, il vérifie si le UGREEN répond (connexion TCP vers
+   `WOL_IP:WOL_PORT`). S'il ne répond pas, il envoie le **paquet magique**,
+   puis recommence toutes les `WOL_RETRY` secondes, jusqu'à `WOL_MAX` essais.
+   Il se désarme dès que le UGREEN répond, ou abandonne après le dernier essai.
+4. **Après une coupure complète**, le conteneur redémarre avec le Synology :
+   si celui-ci a démarré depuis moins de `WOL_BOOT` secondes, Truchement
+   s'arme d'emblée. D'ordinaire le UGREEN redémarre seul et Truchement se
+   contente de le constater ; sinon, il le réveille.
+
+Un NAS UGREEN éteint à la main n'est **jamais** rallumé en dehors de ces deux
+cas (passage sur batterie, démarrage récent du Synology).
+
+Tant que l'onduleur signale une batterie faible (`OL LB` : secteur revenu,
+batterie pas encore rechargée), Truchement attend : le réveil part quand
+`LB` disparaît.
+
+### Prérequis
+
+- **Wake-on-LAN activé dans UGOS** (réglages matériel / alimentation du
+  NAS UGREEN).
+- **Redémarrage automatique après coupure gardé** dans UGOS et DSM : c'est
+  lui qui rallume les NAS après une coupure complète, car certaines cartes
+  réseau n'écoutent plus le Wake-on-LAN après une perte totale
+  d'alimentation.
+- **Au moins 5 minutes d'écart** entre le délai d'arrêt d'UGOS (le plus
+  court) et celui de DSM, pour que le UGREEN soit bien arrêté avant que DSM
+  passe en mode sécurisé.
+- Une **adresse fixe** pour le UGREEN (réservation DHCP) et sa **MAC**
+  (réglages réseau d'UGOS).
+
+### Réglages
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `WOL_MAC` | *(vide = désactivé)* | MAC du NAS UGREEN, `AA:BB:CC:DD:EE:FF` (tirets ou sans séparateur acceptés). **À adapter.** |
+| `WOL_IP` | *(la seule IP d'`ALLOWED_CLIENTS`)* | Adresse du NAS UGREEN. Obligatoire si `ALLOWED_CLIENTS` ne contient pas une seule adresse. |
+| `WOL_PORT` | `445` | Port TCP qui prouve que le UGREEN est allumé (445 = partage de fichiers SMB). Si SMB est coupé, prenez un autre port ouvert, celui de l'interface web d'UGOS par exemple. |
+| `WOL_BROADCAST` | `192.168.1.255` | Adresse de broadcast du LAN (`192.168.1.255` pour `192.168.1.0/24`). **À adapter.** |
+| `WOL_POLL` | `10` | Secondes entre deux lectures de l'état de l'onduleur. |
+| `WOL_STABLE` | `120` | Secondes de secteur stable avant le premier réveil. |
+| `WOL_RETRY` | `60` | Secondes entre deux essais. |
+| `WOL_MAX` | `15` | Essais avant abandon. |
+| `WOL_BOOT` | `900` | Armement au lancement si le Synology a démarré depuis moins de `WOL_BOOT` secondes (`0` = jamais). |
+
+Le paquet magique (6 octets `FF` puis 16 fois la MAC) part en UDP vers
+`WOL_BROADCAST`, ports 9 et 7, trois fois par essai. Il faut le **broadcast
+du LAN**, et non `255.255.255.255` : le conteneur a deux réseaux, et seul le
+broadcast du LAN est sûr de sortir par l'interface macvlan. Au démarrage,
+Truchement vérifie par où sortirait le paquet et prévient si ce n'est pas
+par l'interface qui joint le UGREEN.
+
+### Dans le journal
+
+Au démarrage :
+
+```
+2026-10-26 08:00:05  WoL actif : MAC 6C:1F:F7:12:34:56, cible 192.168.1.201:445, broadcast 192.168.1.255  (sondage 10 s, stable 120 s, relance 60 s, 15 essais, armé au lancement : si hôte démarré depuis < 900 s)
+```
+
+Le trou, comblé :
+
+```
+2026-10-26 03:12:40  *** ups.status : OL -> OB DISCHRG
+2026-10-26 03:12:40  *** WoL : armé (passage sur batterie)
+2026-10-26 03:21:15  *** ups.status : OB DISCHRG -> OL CHRG
+2026-10-26 03:23:16  *** WoL : paquet magique envoyé à 6C:1F:F7:12:34:56 (1/15)
+2026-10-26 03:24:17  *** WoL : paquet magique envoyé à 6C:1F:F7:12:34:56 (2/15)
+2026-10-26 03:25:20  *** WoL : 192.168.1.201 joignable, désarmé
+```
+
+Après une coupure complète, le UGREEN ayant redémarré seul :
+
+```
+2026-10-26 08:00:05  *** WoL : armé (démarrage récent du Synology)
+2026-10-26 08:00:05  *** ups.status : ? -> OL
+2026-10-26 08:02:06  *** WoL : 192.168.1.201 joignable, désarmé
+```
+
+Sans réponse du UGREEN après le dernier essai :
+
+```
+2026-10-26 03:38:20  !!! WoL : abandon après 15 essais
+```
+
+### En cas de souci
+
+| Symptôme | Cause probable |
+|---|---|
+| `!!! WoL : adresse MAC invalide …`, `WOL_IP obligatoire …`, `… hors limites` | Réglage incorrect : le réveil est désactivé, le relais continue normalement. Corrigez la variable et redémarrez le conteneur. |
+| `!!! WoL : le broadcast part de 172.31.93.2 mais la cible est jointe depuis 192.168.1.210` | Mauvais `WOL_BROADCAST` : mettez l'adresse de broadcast du LAN (`192.168.1.255` pour `192.168.1.0/24`). |
+| Paquets envoyés, le UGREEN reste éteint, puis `!!! WoL : abandon après 15 essais` | Wake-on-LAN non activé dans UGOS, mauvaise MAC, ou mauvais broadcast (autre sous-réseau). Si le UGREEN s'est bien allumé malgré l'abandon : `WOL_PORT` est fermé sur le UGREEN, prenez un port ouvert. |
+| Le UGREEN ne se réveille pas après une coupure complète, mais se réveille bien dans le trou | Sa carte réseau n'écoute pas le Wake-on-LAN après une perte totale d'alimentation : gardez le redémarrage automatique après coupure dans UGOS, c'est lui qui couvre ce cas. |
+| `*** WoL : … joignable, désarmé` alors que le UGREEN est éteint | `WOL_IP` désigne une autre machine : vérifiez l'adresse du UGREEN. |
+| `!!! WoL : uptime de l'hôte illisible` | Pas d'armement au démarrage ; le reste du réveil fonctionne. |
+
+## 7. Le journal
 
 Par défaut (`VERBOSE: "0"`), le journal reste court. Il note :
 
@@ -188,14 +326,16 @@ Par défaut (`VERBOSE: "0"`), le journal reste court. Il note :
 - les erreurs NUT (sauf `FEATURE-NOT-CONFIGURED`, sans intérêt) ;
 - **chaque changement d'état de l'onduleur**, par exemple
   `*** ups.status : OL -> OB DISCHRG` à la coupure de courant ;
-- les connexions refusées et un serveur NUT injoignable.
+- les connexions refusées et un serveur NUT injoignable ;
+- les événements du réveil Wake-on-LAN (`*** WoL : …`, `!!! WoL : …`), voir
+  [6. Réveil du NAS UGREEN](#6-réveil-du-nas-ugreen-wake-on-lan).
 
 Avec `VERBOSE: "1"`, tout le dialogue s'affiche, sauf le contenu des listes
 de variables (seul leur nombre de lignes est noté). Pratique pour mettre au
 point, trop bavard au quotidien : UGOS interroge l'onduleur toutes les
 quelques secondes.
 
-## 7. Sécurité
+## 8. Sécurité
 
 Le relais **accepte n'importe quels identifiants** de la part d'un client
 autorisé et les remplace par ceux de DSM : la seule barrière est donc
@@ -207,7 +347,7 @@ Les identifiants `monuser` / `secret` ne sont pas un secret : ce sont ceux,
 fixes et publics, du serveur NUT de DSM. Ce qui protège ce serveur, c'est sa
 liste de périphériques autorisés — qui ne contient que le relais.
 
-## 8. En cas de souci
+## 9. En cas de souci
 
 | Symptôme | Cause probable |
 |---|---|
@@ -218,6 +358,7 @@ liste de périphériques autorisés — qui ne contient que le relais.
 | Erreur sur le réseau `interne` (*pool overlaps*) | `172.31.93.0/24` est déjà utilisé par un autre réseau Docker : choisissez un autre sous-réseau, et mettez à jour l'adresse autorisée dans DSM. |
 | Le Synology ne répond pas au ping vers 192.168.1.210 | Normal : c'est la limite du macvlan décrite plus haut. Testez depuis une autre machine. |
 | UGOS ne voit pas l'onduleur | Passez `VERBOSE: "1"` et regardez ce qu'UGOS demande et ce que DSM répond. |
+| Le UGREEN reste éteint après une coupure de courant | Voir le dépannage du réveil, en fin de [6. Réveil du NAS UGREEN](#6-réveil-du-nas-ugreen-wake-on-lan). |
 
 Pour tester depuis un PC équipé des outils NUT, ajoutez son adresse à
 `ALLOWED_CLIENTS`, puis :
@@ -229,7 +370,7 @@ upsc ups0@192.168.1.210
 La commande doit lister les variables de l'onduleur (`ups.status: OL`,
 `battery.charge`…).
 
-## 9. Licence
+## 10. Licence
 
 Truchement est un **logiciel libre**, distribué sous la licence
 **GNU General Public License, version 3 ou ultérieure** (GPL-3.0-or-later).

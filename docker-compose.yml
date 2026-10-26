@@ -1,4 +1,4 @@
-# Truchement 1.0 — relais NUT Synology (ups) -> UGOS (ups0)
+# Truchement 1.1.0 — relais NUT Synology (ups) -> UGOS (ups0)
 # Copyright (C) 2026 ETDEL — https://github.com/theptitprince/Truchement
 # Logiciel libre : GPL-3.0-or-later, avec les conditions additionnelles de NOTICE.
 # Voir les fichiers LICENSE et NOTICE du dépôt. Fourni SANS AUCUNE GARANTIE.
@@ -29,6 +29,16 @@ services:
       NUT_USER: monuser               # identifiants fixes du serveur NUT de DSM
       NUT_PASS: secret
       VERBOSE: "0"
+      # Réveil Wake-on-LAN du NAS UGREEN au retour secteur (WOL_MAC vide = désactivé)
+      WOL_MAC: ""                     # à adapter : MAC du NAS UGREEN, ex. 6C:1F:F7:12:34:56
+      WOL_IP: ""                      # vide = la seule IP d'ALLOWED_CLIENTS
+      WOL_PORT: "445"                 # port TCP qui prouve que le NAS UGREEN est allumé
+      WOL_BROADCAST: 192.168.1.255    # à adapter : adresse de broadcast du LAN
+      WOL_POLL: "10"                  # secondes entre deux lectures de l'état de l'onduleur
+      WOL_STABLE: "120"               # secondes de secteur stable avant le premier réveil
+      WOL_RETRY: "60"                 # secondes entre deux essais
+      WOL_MAX: "15"                   # nombre d'essais avant abandon
+      WOL_BOOT: "900"                 # réveil si le Synology a démarré il y a moins de 900 s (0 = non)
     command:
       - python
       - -u
@@ -49,16 +59,31 @@ services:
           VERBOSE [0] : 0 = journal réduit (connexions d'auth, erreurs, changements d'état UPS)
                         1 = tout le dialogue (hors contenu des LIST VAR)
 
+        Réveil Wake-on-LAN du client au retour secteur (inactif si WOL_MAC est vide) :
+          WOL_MAC [vide] : MAC du NAS à réveiller (AA:BB:CC:DD:EE:FF, tirets ou sans séparateur acceptés)
+          WOL_IP [la seule IP d'ALLOWED_CLIENTS] : IP du NAS, obligatoire si ALLOWED_CLIENTS n'en a pas une seule
+          WOL_PORT [445] : port TCP testé pour savoir si le NAS répond
+          WOL_BROADCAST [192.168.1.255] : broadcast dirigé du LAN (sort par l'interface macvlan)
+          WOL_POLL [10] : période, en secondes, de lecture de ups.status sur le serveur NUT
+          WOL_STABLE [120] : secondes de secteur (OL) stable avant le premier paquet magique
+          WOL_RETRY [60] : secondes entre deux essais
+          WOL_MAX [15] : essais avant abandon
+          WOL_BOOT [900] : armé au lancement si l'hôte a démarré depuis moins de WOL_BOOT s (0 = non)
+          Armé par OB, LB ou FSD, ou par un démarrage récent de l'hôte ; désarmé dès que le NAS
+          répond, ou après WOL_MAX essais. Un NAS éteint à la main n'est jamais rallumé hors de ces cas.
+
         Truchement, par ETDEL — https://github.com/theptitprince/Truchement
         Copyright (C) 2026 ETDEL — GPL-3.0-or-later, voir LICENSE et NOTICE.
         """
+        import ipaddress
         import os
         import re
         import socket
         import threading
+        import time
         from datetime import datetime
 
-        APP_VERSION = "1.0"
+        APP_VERSION = "1.1.0"
         ORIGINE = "Truchement, par ETDEL — https://github.com/theptitprince/Truchement"
 
         UPSTREAM = (os.getenv("UPSTREAM_HOST", "192.168.1.200"), int(os.getenv("UPSTREAM_PORT", "3493")))
@@ -77,14 +102,15 @@ services:
 
 
         def suivre_statut(ligne):
-            """Journalise chaque changement de ups.status (OL, OB, LB, FSD...)."""
+            """Journalise chaque changement de ups.status (OL, OB, LB, FSD...) ; renvoie le statut lu."""
             m = RE_STATUS.match(ligne)
             if not m:
-                return
+                return None
             with _verrou:
                 if m.group(1) != _etat["status"]:
                     log(f"*** ups.status : {_etat['status'] or '?'} -> {m.group(1)}")
                     _etat["status"] = m.group(1)
+            return m.group(1)
 
         # Nom d'UPS en tant que mot isolé (hors valeurs entre guillemets et noms de variables)
         RE_CLIENT = re.compile(rf'(?<![\w."-]){re.escape(CLIENT_UPS)}(?![\w."-])')
@@ -179,8 +205,199 @@ services:
                 log(f"--- fin {peer}")
 
 
+        # --- Réveil Wake-on-LAN du client au retour secteur ------------------------------------
+        # Cas couvert : le client s'est arrêté sur batterie, puis le secteur revient avant que
+        # l'onduleur ne coupe ses prises ; le client n'est alors jamais réalimenté et reste éteint.
+        # Tout se passe dans un fil à part : aucune erreur du réveil ne doit toucher au relais.
+
+
+        def _entier(nom, defaut):
+            return int(os.getenv(nom, "").strip() or defaut)
+
+
+        def config_wol():
+            """Lit la configuration WoL. Renvoie None (réveil inactif) si WOL_MAC est vide ou invalide."""
+            mac = os.getenv("WOL_MAC", "").strip()
+            if not mac:
+                log("WoL inactif (WOL_MAC vide)")
+                return None
+            try:
+                hexa = re.sub(r"[:.-]", "", mac)
+                if not re.fullmatch(r"[0-9A-Fa-f]{12}", hexa):
+                    raise ValueError(f"adresse MAC invalide « {mac} »")
+                ip = os.getenv("WOL_IP", "").strip()
+                if not ip:
+                    if len(ALLOWED) != 1:
+                        raise ValueError("WOL_IP obligatoire quand ALLOWED_CLIENTS ne contient pas une seule IP")
+                    ip = next(iter(ALLOWED))
+                broadcast = os.getenv("WOL_BROADCAST", "").strip() or "192.168.1.255"
+                ipaddress.IPv4Address(ip)
+                ipaddress.IPv4Address(broadcast)
+                cfg = {
+                    "mac": ":".join(hexa[i:i + 2] for i in range(0, 12, 2)).upper(),
+                    "paquet": b"\xff" * 6 + bytes.fromhex(hexa) * 16,
+                    "ip": ip,
+                    "port": _entier("WOL_PORT", 445),
+                    "broadcast": broadcast,
+                    "poll": _entier("WOL_POLL", 10),
+                    "stable": _entier("WOL_STABLE", 120),
+                    "retry": _entier("WOL_RETRY", 60),
+                    "max": _entier("WOL_MAX", 15),
+                    "boot": _entier("WOL_BOOT", 900),
+                }
+                if not 0 < cfg["port"] < 65536 or cfg["poll"] < 1 or cfg["max"] < 1 \
+                        or min(cfg["stable"], cfg["retry"], cfg["boot"]) < 0:
+                    raise ValueError("WOL_PORT, WOL_POLL, WOL_STABLE, WOL_RETRY, WOL_MAX ou WOL_BOOT hors limites")
+            except ValueError as e:
+                log(f"!!! WoL : {e} ; réveil désactivé")
+                return None
+            au_demarrage = f"si hôte démarré depuis < {cfg['boot']} s" if cfg["boot"] else "non"
+            log(f"WoL actif : MAC {cfg['mac']}, cible {cfg['ip']}:{cfg['port']}, broadcast {cfg['broadcast']}  "
+                f"(sondage {cfg['poll']} s, stable {cfg['stable']} s, relance {cfg['retry']} s, "
+                f"{cfg['max']} essais, armé au lancement : {au_demarrage})")
+            verifier_sortie(cfg)
+            return cfg
+
+
+        def adresse_source(destination, broadcast=False):
+            """Adresse locale que le noyau choisit pour joindre destination (aucun paquet émis)."""
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                if broadcast:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.connect((destination, 9))
+                return s.getsockname()[0]
+
+
+        def verifier_sortie(cfg):
+            """Le broadcast doit partir par la même interface que celle qui joint la cible (le macvlan)."""
+            try:
+                par_broadcast = adresse_source(cfg["broadcast"], broadcast=True)
+                par_cible = adresse_source(cfg["ip"])
+            except OSError as e:
+                log(f"!!! WoL : route vers {cfg['broadcast']} introuvable : {e}")
+                return
+            if par_broadcast != par_cible:
+                log(f"!!! WoL : le broadcast part de {par_broadcast} mais la cible est jointe depuis "
+                    f"{par_cible} : vérifiez WOL_BROADCAST")
+
+
+        def uptime_hote():
+            """Secondes depuis le démarrage de l'hôte (/proc/uptime n'est pas isolé par Docker)."""
+            with open("/proc/uptime") as f:
+                return float(f.read().split()[0])
+
+
+        def cible_joignable(cfg):
+            try:
+                with socket.create_connection((cfg["ip"], cfg["port"]), timeout=3):
+                    return True
+            except OSError:
+                return False
+
+
+        def envoyer_paquet(cfg):
+            """Paquet magique (6 x FF puis 16 x la MAC), en broadcast UDP sur les ports 9 et 7, 3 fois."""
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                for _ in range(3):
+                    for port in (9, 7):
+                        s.sendto(cfg["paquet"], (cfg["broadcast"], port))
+
+
+        def lire_statut(w):
+            """Demande ups.status au serveur NUT, sur une connexion gardée ouverte.
+
+            Sans LOGIN : le serveur n'a pas à attendre ce lecteur avant de s'arrêter.
+            Renvoie None si le serveur ne répond pas ; la reconnexion se fait au tour suivant.
+            """
+            try:
+                if w["sock"] is None:
+                    s = socket.create_connection(UPSTREAM, timeout=5)
+                    w["sock"], w["fichier"] = s, s.makefile("rb")
+                w["sock"].sendall(f"GET VAR {SERVER_UPS} ups.status\n".encode())
+                ligne = w["fichier"].readline()
+                if not ligne:
+                    raise OSError("connexion fermée")
+            except OSError:
+                for objet in (w["fichier"], w["sock"]):
+                    try:
+                        if objet is not None:
+                            objet.close()
+                    except OSError:
+                        pass
+                w["sock"] = w["fichier"] = None
+                return None
+            return suivre_statut(ligne.decode(errors="replace").rstrip("\r\n"))
+
+
+        def etape_wol(cfg, w):
+            statut = lire_statut(w)
+            if statut is None:
+                # Serveur injoignable (Synology en mode sécurisé...) : on reste armé, sans compter.
+                w["ol_depuis"] = None
+                return
+            drapeaux = set(statut.split())
+            if drapeaux & {"OB", "LB", "FSD"}:
+                if not w["batterie"]:
+                    log("*** WoL : armé (passage sur batterie)")
+                w.update(arme=True, batterie=True, ol_depuis=None, essais=0)
+                return
+            w["batterie"] = False
+            if not w["arme"] or "OL" not in drapeaux:
+                w["ol_depuis"] = None
+                return
+            maintenant = time.monotonic()
+            if w["ol_depuis"] is None:
+                w["ol_depuis"] = maintenant
+            if maintenant - w["ol_depuis"] < cfg["stable"]:
+                return
+            if cible_joignable(cfg):
+                log(f"*** WoL : {cfg['ip']} joignable, désarmé")
+                w["arme"] = False
+                return
+            if w["essais"] and maintenant - w["dernier"] < cfg["retry"]:
+                return
+            if w["essais"] >= cfg["max"]:
+                log(f"!!! WoL : abandon après {w['essais']} essais")
+                w["arme"] = False
+                return
+            w["essais"] += 1
+            w["dernier"] = maintenant
+            try:
+                envoyer_paquet(cfg)
+            except OSError as e:
+                log(f"!!! WoL : envoi du paquet magique impossible ({w['essais']}/{cfg['max']}) : {e}")
+                return
+            log(f"*** WoL : paquet magique envoyé à {cfg['mac']} ({w['essais']}/{cfg['max']})")
+
+
+        def surveiller_wol(cfg):
+            w = {"arme": False, "batterie": False, "ol_depuis": None, "essais": 0, "dernier": 0.0,
+                 "sock": None, "fichier": None}
+            if cfg["boot"]:
+                try:
+                    if uptime_hote() < cfg["boot"]:
+                        w["arme"] = True
+                        log("*** WoL : armé (démarrage récent du Synology)")
+                except (OSError, ValueError, IndexError) as e:
+                    log(f"!!! WoL : uptime de l'hôte illisible ({e}), pas d'armement au démarrage")
+            while True:
+                try:
+                    etape_wol(cfg, w)
+                except Exception as e:
+                    log(f"!!! WoL : erreur inattendue : {e!r}")
+                time.sleep(cfg["poll"])
+
+
         def main():
             log(f"{ORIGINE} — version {APP_VERSION}")
+            try:
+                cfg_wol = config_wol()
+            except Exception as e:
+                log(f"!!! WoL : erreur inattendue à la configuration : {e!r} ; réveil désactivé")
+                cfg_wol = None
+            if cfg_wol:
+                threading.Thread(target=surveiller_wol, args=(cfg_wol,), daemon=True).start()
             srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             srv.bind((LISTEN_HOST, LISTEN_PORT))

@@ -4,7 +4,7 @@
 
 **One UPS on the Synology, the UGREEN warned too.**
 
-![Version](https://img.shields.io/badge/version-1.0-2ea44f)
+![Version](https://img.shields.io/badge/version-1.1.0-2ea44f)
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![Docker Compose](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
 ![NUT](https://img.shields.io/badge/protocol-NUT%20%2F%203493-0a7ea4)
@@ -37,6 +37,10 @@ everything else through untouched. When the power fails, UGOS sees the UPS
 go on battery (`OB`), then low battery (`LB`) or forced shutdown (`FSD`),
 exactly as the Synology does.
 
+Since 1.1.0, Truchement can also **wake the UGREEN NAS with Wake-on-LAN**
+when the power comes back after it has already shut down: otherwise it would
+stay off (see [6. Waking the UGREEN NAS](#6-waking-the-ugreen-nas-wake-on-lan)).
+
 ```
  UGREEN (UGOS)                    TRUCHEMENT                       SYNOLOGY (DSM)
  NUT client        ----------->   192.168.1.210:3493   ---------->  NUT server
@@ -45,7 +49,7 @@ exactly as the Synology does.
                    <-----------   ups ↔ ups0           <----------  monuser / secret
 ```
 
-Current version: 1.0 — the release history is in
+Current version: 1.1.0 — the release history is in
 [CHANGELOG.md](CHANGELOG.md) (in French).
 
 ## Contents
@@ -55,10 +59,11 @@ Current version: 1.0 — the release history is in
 - [3. Installation](#3-installation)
 - [4. Settings](#4-settings)
 - [5. How it works](#5-how-it-works)
-- [6. The log](#6-the-log)
-- [7. Security](#7-security)
-- [8. Troubleshooting](#8-troubleshooting)
-- [9. License](#9-license)
+- [6. Waking the UGREEN NAS (Wake-on-LAN)](#6-waking-the-ugreen-nas-wake-on-lan)
+- [7. The log](#7-the-log)
+- [8. Security](#8-security)
+- [9. Troubleshooting](#9-troubleshooting)
+- [10. License](#10-license)
 
 ---
 
@@ -107,15 +112,17 @@ the script is included in the compose file.
    starts the `truchement` container.
 
 In the container log (*Container Manager > Container > truchement > Log*),
-two lines should appear:
+three lines should appear:
 
 ```
-2026-10-23 14:02:11  Truchement, par ETDEL — https://github.com/theptitprince/Truchement — version 1.0
+2026-10-23 14:02:11  Truchement, par ETDEL — https://github.com/theptitprince/Truchement — version 1.1.0
+2026-10-23 14:02:11  WoL inactif (WOL_MAC vide)
 2026-10-23 14:02:11  Relais NUT 0.0.0.0:3493 -> 172.31.93.1:3493  (UPS ups0 <-> ups, clients 192.168.1.201)
 ```
 
 The log messages are in French; the ones that matter are explained in
-[6. The log](#6-the-log) and [8. Troubleshooting](#8-troubleshooting).
+[7. The log](#7-the-log) and [9. Troubleshooting](#9-troubleshooting). To wake
+the UGREEN NAS, see [6. Waking the UGREEN NAS](#6-waking-the-ugreen-nas-wake-on-lan).
 
 ### On the UGREEN: listen to the relay
 
@@ -144,13 +151,14 @@ show the UPS, its status and its load.
 | `UPSTREAM_PORT` | `3493` | NUT server port. |
 | `LISTEN_HOST` | `0.0.0.0` | Relay listening address. |
 | `LISTEN_PORT` | `3493` | Relay listening port. |
-| `ALLOWED_CLIENTS` | *(empty = everyone)* | Addresses allowed to connect, comma-separated. **Fill it in**: see [7. Security](#7-security). |
+| `ALLOWED_CLIENTS` | *(empty = everyone)* | Addresses allowed to connect, comma-separated. **Fill it in**: see [8. Security](#8-security). |
 | `CLIENT_UPS` | `ups0` | UPS name on the client side (UGOS). |
 | `SERVER_UPS` | `ups` | UPS name on the server side (DSM). |
 | `NUT_USER` | `monuser` | Username sent to the NUT server (DSM's is fixed). |
 | `NUT_PASS` | `secret` | Password sent to the NUT server (DSM's is fixed). |
 | `VERBOSE` | `0` | `0`: short log; `1`: the whole dialogue. |
 | `TZ` | `Europe/Paris` | Time zone of the log timestamps. |
+| `WOL_MAC`, `WOL_IP`, `WOL_PORT`, `WOL_BROADCAST`, `WOL_POLL`, `WOL_STABLE`, `WOL_RETRY`, `WOL_MAX`, `WOL_BOOT` | *(empty `WOL_MAC` = off)* | Wake-on-LAN of the UGREEN NAS: see [6. Waking the UGREEN NAS](#6-waking-the-ugreen-nas-wake-on-lan). |
 
 After a change: *Container Manager > Project > truchement > Action > Build*
 (or Stop then Start) so that the container picks it up.
@@ -181,7 +189,135 @@ Only the UPS name as a standalone word is replaced: variable names
 goes through untouched, including the `LOGIN` and `FSD` commands that
 trigger the machines' shutdown.
 
-## 6. The log
+## 6. Waking the UGREEN NAS (Wake-on-LAN)
+
+### The gap
+
+On battery, the UGREEN NAS shuts down first (UGOS shutdown delay), the
+Synology a few minutes later (DSM delay: safe mode, then the UPS cuts its
+outlets). Both NAS restart by themselves when the power returns, thanks to
+their restart-after-power-failure setting.
+
+But if the power comes back **after the UGREEN has shut down and before the
+UPS cuts its outlets**, the UGREEN never lost power: its automatic restart
+is not triggered, and **it stays off indefinitely**.
+
+```
+mains        ━━━━━━━━┓                      ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                     ┗━━━━━ outage ━━━━━━━━━┛
+UGREEN NAS   ━━━━━━━━━━━━━━━━━┓ shutdown (UGOS)
+                              ┗━━━━━━━━━━━━━━━━━━ off ……… without WoL: forever
+Synology     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ (its delay is not reached)
+                                            ↑ the gap: Truchement sends the magic packet
+```
+
+### What Truchement does
+
+1. **It reads the UPS status itself** from DSM's NUT server, every
+   `WOL_POLL` seconds, without waiting for UGOS's questions — once off, the
+   UGREEN asks nothing. It opens no session (`LOGIN`): DSM does not have to
+   wait for it before shutting down.
+2. **It arms** as soon as the UPS goes on battery (`OB`), low battery (`LB`)
+   or forced shutdown (`FSD`). An unreachable NUT server (DSM in safe mode)
+   does not disarm it.
+3. **When the power returns**, once the `OL` status has been stable for
+   `WOL_STABLE` seconds, it checks whether the UGREEN answers (TCP connection
+   to `WOL_IP:WOL_PORT`). If not, it sends the **magic packet**, then again
+   every `WOL_RETRY` seconds, up to `WOL_MAX` attempts. It disarms as soon as
+   the UGREEN answers, or gives up after the last attempt.
+4. **After a complete power loss**, the container restarts with the
+   Synology: if the latter booted less than `WOL_BOOT` seconds ago,
+   Truchement arms straight away. Usually the UGREEN restarts by itself and
+   Truchement merely notes it; otherwise, it wakes it up.
+
+A UGREEN NAS switched off by hand is **never** switched back on outside
+these two cases (going on battery, recent Synology boot).
+
+While the UPS reports a low battery (`OL LB`: power back, battery not yet
+recharged), Truchement waits: the wake-up goes out once `LB` clears.
+
+### Requirements
+
+- **Wake-on-LAN enabled in UGOS** (hardware / power settings of the UGREEN
+  NAS).
+- **Restart after power failure kept on** in UGOS and DSM: it is what
+  switches the NAS back on after a complete power loss, because some network
+  cards no longer listen to Wake-on-LAN after a total loss of power.
+- **At least 5 minutes between** the UGOS shutdown delay (the shorter one)
+  and the DSM one, so that the UGREEN is fully off well before DSM enters
+  safe mode.
+- A **fixed address** for the UGREEN (DHCP reservation) and its **MAC**
+  (UGOS network settings).
+
+### Settings
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `WOL_MAC` | *(empty = off)* | MAC of the UGREEN NAS, `AA:BB:CC:DD:EE:FF` (dashes or no separator accepted). **To adapt.** |
+| `WOL_IP` | *(the only IP in `ALLOWED_CLIENTS`)* | Address of the UGREEN NAS. Required if `ALLOWED_CLIENTS` does not hold exactly one address. |
+| `WOL_PORT` | `445` | TCP port proving the UGREEN is on (445 = SMB file sharing). If SMB is off, pick another open port, the UGOS web interface's for instance. |
+| `WOL_BROADCAST` | `192.168.1.255` | LAN broadcast address (`192.168.1.255` for `192.168.1.0/24`). **To adapt.** |
+| `WOL_POLL` | `10` | Seconds between two UPS status reads. |
+| `WOL_STABLE` | `120` | Seconds of stable mains power before the first wake-up. |
+| `WOL_RETRY` | `60` | Seconds between two attempts. |
+| `WOL_MAX` | `15` | Attempts before giving up. |
+| `WOL_BOOT` | `900` | Arm at start-up if the Synology booted less than `WOL_BOOT` seconds ago (`0` = never). |
+
+The magic packet (6 bytes `FF` then the MAC 16 times) goes out over UDP to
+`WOL_BROADCAST`, ports 9 and 7, three times per attempt. It needs the **LAN
+broadcast**, not `255.255.255.255`: the container has two networks, and only
+the LAN broadcast is sure to leave through the macvlan interface. At
+start-up, Truchement checks which way the packet would leave and warns if it
+is not the interface that reaches the UGREEN.
+
+### In the log
+
+At start-up:
+
+```
+2026-10-26 08:00:05  WoL actif : MAC 6C:1F:F7:12:34:56, cible 192.168.1.201:445, broadcast 192.168.1.255  (sondage 10 s, stable 120 s, relance 60 s, 15 essais, armé au lancement : si hôte démarré depuis < 900 s)
+```
+
+The gap, filled (`armé` = armed, `paquet magique envoyé` = magic packet
+sent, `joignable, désarmé` = reachable, disarmed):
+
+```
+2026-10-26 03:12:40  *** ups.status : OL -> OB DISCHRG
+2026-10-26 03:12:40  *** WoL : armé (passage sur batterie)
+2026-10-26 03:21:15  *** ups.status : OB DISCHRG -> OL CHRG
+2026-10-26 03:23:16  *** WoL : paquet magique envoyé à 6C:1F:F7:12:34:56 (1/15)
+2026-10-26 03:24:17  *** WoL : paquet magique envoyé à 6C:1F:F7:12:34:56 (2/15)
+2026-10-26 03:25:20  *** WoL : 192.168.1.201 joignable, désarmé
+```
+
+After a complete power loss, the UGREEN having restarted by itself
+(`démarrage récent du Synology` = recent Synology boot):
+
+```
+2026-10-26 08:00:05  *** WoL : armé (démarrage récent du Synology)
+2026-10-26 08:00:05  *** ups.status : ? -> OL
+2026-10-26 08:02:06  *** WoL : 192.168.1.201 joignable, désarmé
+```
+
+No answer from the UGREEN after the last attempt (`abandon après 15 essais` =
+giving up after 15 attempts):
+
+```
+2026-10-26 03:38:20  !!! WoL : abandon après 15 essais
+```
+
+### Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| `!!! WoL : adresse MAC invalide …`, `WOL_IP obligatoire …`, `… hors limites` | Wrong setting: the wake-up is disabled, the relay keeps working normally. Fix the variable and restart the container. |
+| `!!! WoL : le broadcast part de 172.31.93.2 mais la cible est jointe depuis 192.168.1.210` | Wrong `WOL_BROADCAST`: use the LAN broadcast address (`192.168.1.255` for `192.168.1.0/24`). |
+| Packets sent, the UGREEN stays off, then `!!! WoL : abandon après 15 essais` | Wake-on-LAN not enabled in UGOS, wrong MAC, or wrong broadcast (another subnet). If the UGREEN did come on despite the give-up: `WOL_PORT` is closed on the UGREEN, pick an open port. |
+| The UGREEN does not wake after a complete power loss, but does wake in the gap | Its network card does not listen to Wake-on-LAN after a total loss of power: keep restart after power failure on in UGOS, that is what covers this case. |
+| `*** WoL : … joignable, désarmé` while the UGREEN is off | `WOL_IP` points to another machine: check the UGREEN's address. |
+| `!!! WoL : uptime de l'hôte illisible` | No arming at start-up; the rest of the wake-up works. |
+
+## 7. The log
 
 By default (`VERBOSE: "0"`), the log stays short. It records:
 
@@ -191,13 +327,15 @@ By default (`VERBOSE: "0"`), the log stays short. It records:
 - **each UPS status change**, for instance
   `*** ups.status : OL -> OB DISCHRG` when the power fails;
 - refused connections (`connexion refusée`) and an unreachable NUT server
-  (`injoignable`).
+  (`injoignable`);
+- the Wake-on-LAN events (`*** WoL : …`, `!!! WoL : …`), see
+  [6. Waking the UGREEN NAS](#6-waking-the-ugreen-nas-wake-on-lan).
 
 With `VERBOSE: "1"`, the whole dialogue is shown, except the content of
 variable lists (only their line count is noted). Handy for debugging, too
 chatty for everyday use: UGOS polls the UPS every few seconds.
 
-## 7. Security
+## 8. Security
 
 The relay **accepts any credentials** from an allowed client and replaces
 them with DSM's: `ALLOWED_CLIENTS` is therefore the only barrier. Fill it
@@ -208,7 +346,7 @@ The `monuser` / `secret` credentials are not a secret: they are DSM's NUT
 server's fixed, public ones. What protects that server is its list of
 permitted devices — which only holds the relay.
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
@@ -219,6 +357,7 @@ permitted devices — which only holds the relay.
 | Error on the `interne` network (*pool overlaps*) | `172.31.93.0/24` is already used by another Docker network: pick another subnet, and update the permitted address in DSM. |
 | The Synology does not answer pings to 192.168.1.210 | Expected: that is the macvlan limitation described above. Test from another machine. |
 | UGOS does not see the UPS | Set `VERBOSE: "1"` and look at what UGOS asks and what DSM answers. |
+| The UGREEN stays off after a power failure | See the wake-up troubleshooting at the end of [6. Waking the UGREEN NAS](#6-waking-the-ugreen-nas-wake-on-lan). |
 
 To test from a PC with the NUT tools installed, add its address to
 `ALLOWED_CLIENTS`, then:
@@ -230,7 +369,7 @@ upsc ups0@192.168.1.210
 The command should list the UPS variables (`ups.status: OL`,
 `battery.charge`…).
 
-## 9. License
+## 10. License
 
 Truchement is **free software**, released under the
 **GNU General Public License, version 3 or later** (GPL-3.0-or-later).
